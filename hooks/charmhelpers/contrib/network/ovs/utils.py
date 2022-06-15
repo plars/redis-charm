@@ -1,4 +1,4 @@
-# Copyright 2014-2015 Canonical Limited.
+# Copyright 2019 Canonical Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,3 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import subprocess
+
+
+def _run(*args):
+    """Run a process, check result, capture decoded output from STDOUT.
+
+    :param args: Command and arguments to run
+    :type args: Tuple[str, ...]
+    :returns: Information about the completed process
+    :rtype: str
+    :raises subprocess.CalledProcessError
+    """
+    return subprocess.check_output(args, universal_newlines=True)

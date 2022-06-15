@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import json
-import six
 
 from charmhelpers.core.hookenv import relation_id as current_relation_id
 from charmhelpers.core.hookenv import (
@@ -229,7 +228,7 @@ def peer_echo(includes=None, force=False):
             if ex in echo_data:
                 echo_data.pop(ex)
     else:
-        for attribute, value in six.iteritems(rdata):
+        for attribute, value in rdata.items():
             for include in includes:
                 if include in attribute:
                     echo_data[attribute] = value
@@ -248,15 +247,15 @@ def peer_store_and_set(relation_id=None, peer_relation_name='cluster',
     @param relation_id: the id of the relation to store the data on. Defaults
                         to the current relation.
     @param peer_store_fatal: Set to True, the function will raise an exception
-                             should the peer sotrage not be avialable."""
+                             should the peer storage not be available."""
 
     relation_settings = relation_settings if relation_settings else {}
     relation_set(relation_id=relation_id,
                  relation_settings=relation_settings,
                  **kwargs)
     if is_relation_made(peer_relation_name):
-        for key, value in six.iteritems(dict(list(kwargs.items()) +
-                                             list(relation_settings.items()))):
+        items = dict(list(kwargs.items()) + list(relation_settings.items()))
+        for key, value in items.items():
             key_prefix = relation_id or current_relation_id()
             peer_store(key_prefix + delimiter + key,
                        value,

@@ -1,4 +1,4 @@
-# Copyright 2014-2015 Canonical Limited.
+# Copyright 2012-2021 Canonical Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,26 +13,27 @@
 # limitations under the License.
 
 """Compatibility with the nrpe-external-master charm"""
-# Copyright 2012 Canonical Ltd.
 #
 # Authors:
 #  Matthew Wedgwood <matthew.wedgwood@canonical.com>
 
-import subprocess
-import pwd
+import glob
 import grp
 import os
-import glob
-import shutil
+import pwd
 import re
 import shlex
+import shutil
+import subprocess
 import yaml
 
 from charmhelpers.core.hookenv import (
+    application_name,
     config,
     hook_name,
     local_unit,
     log,
+    relation_get,
     relation_ids,
     relation_set,
     relations_of_type,
@@ -138,10 +139,11 @@ define service {{
                         """{description}
     check_command                   check_nrpe!{command}
     servicegroups                   {nagios_servicegroup}
+{service_config_overrides}
 }}
 """)
 
-    def __init__(self, shortname, description, check_cmd):
+    def __init__(self, shortname, description, check_cmd, max_check_attempts=None):
         super(Check, self).__init__()
         # XXX: could be better to calculate this from the service name
         if not re.match(self.shortname_re, shortname):
@@ -154,6 +156,7 @@ define service {{
         # The default is: illegal_object_name_chars=`~!$%^&*"|'<>?,()=
         self.description = description
         self.check_cmd = self._locate_cmd(check_cmd)
+        self.max_check_attempts = max_check_attempts
 
     def _get_check_filename(self):
         return os.path.join(NRPE.nrpe_confdir, '{}.cfg'.format(self.command))
@@ -172,7 +175,8 @@ define service {{
             if os.path.exists(os.path.join(path, parts[0])):
                 command = os.path.join(path, parts[0])
                 if len(parts) > 1:
-                    command += " " + " ".join(parts[1:])
+                    safe_args = [shlex.quote(arg) for arg in parts[1:]]
+                    command += " " + " ".join(safe_args)
                 return command
         log('Check command not found: {}'.format(parts[0]))
         return ''
@@ -215,12 +219,19 @@ define service {{
                              nagios_servicegroups):
         self._remove_service_files()
 
+        if self.max_check_attempts:
+            service_config_overrides = '    max_check_attempts              {}'.format(
+                self.max_check_attempts
+            )  # Note indentation is here rather than in the template to avoid trailing spaces
+        else:
+            service_config_overrides = ''  # empty string to avoid printing 'None'
         templ_vars = {
             'nagios_hostname': hostname,
             'nagios_servicegroup': nagios_servicegroups,
             'description': self.description,
             'shortname': self.shortname,
             'command': self.command,
+            'service_config_overrides': service_config_overrides,
         }
         nrpe_service_text = Check.service_template.format(**templ_vars)
         nrpe_service_file = self._get_service_filename(hostname)
@@ -260,11 +271,28 @@ class NRPE(object):
         relation = relation_ids('nrpe-external-master')
         if relation:
             log("Setting charm primary status {}".format(primary))
-            for rid in relation_ids('nrpe-external-master'):
+            for rid in relation:
                 relation_set(relation_id=rid, relation_settings={'primary': self.primary})
+        self.remove_check_queue = set()
+
+    @classmethod
+    def does_nrpe_conf_dir_exist(cls):
+        """Return True if th nrpe_confdif directory exists."""
+        return os.path.isdir(cls.nrpe_confdir)
 
     def add_check(self, *args, **kwargs):
+        shortname = None
+        if kwargs.get('shortname') is None:
+            if len(args) > 0:
+                shortname = args[0]
+        else:
+            shortname = kwargs['shortname']
+
         self.checks.append(Check(*args, **kwargs))
+        try:
+            self.remove_check_queue.remove(shortname)
+        except KeyError:
+            pass
 
     def remove_check(self, *args, **kwargs):
         if kwargs.get('shortname') is None:
@@ -281,6 +309,7 @@ class NRPE(object):
 
         check = Check(*args, **kwargs)
         check.remove(self.hostname)
+        self.remove_check_queue.add(kwargs['shortname'])
 
     def write(self):
         try:
@@ -296,12 +325,21 @@ class NRPE(object):
 
         nrpe_monitors = {}
         monitors = {"monitors": {"remote": {"nrpe": nrpe_monitors}}}
+
+        # check that the charm can write to the conf dir.  If not, then nagios
+        # probably isn't installed, and we can defer.
+        if not self.does_nrpe_conf_dir_exist():
+            return
+
         for nrpecheck in self.checks:
             nrpecheck.write(self.nagios_context, self.hostname,
                             self.nagios_servicegroups)
             nrpe_monitors[nrpecheck.shortname] = {
                 "command": nrpecheck.command,
             }
+            # If we were passed max_check_attempts, add that to the relation data
+            if nrpecheck.max_check_attempts is not None:
+                nrpe_monitors[nrpecheck.shortname]['max_check_attempts'] = nrpecheck.max_check_attempts
 
         # update-status hooks are configured to firing every 5 minutes by
         # default. When nagios-nrpe-server is restarted, the nagios server
@@ -313,7 +351,24 @@ class NRPE(object):
         monitor_ids = relation_ids("local-monitors") + \
             relation_ids("nrpe-external-master")
         for rid in monitor_ids:
-            relation_set(relation_id=rid, monitors=yaml.dump(monitors))
+            reldata = relation_get(unit=local_unit(), rid=rid)
+            if 'monitors' in reldata:
+                # update the existing set of monitors with the new data
+                old_monitors = yaml.safe_load(reldata['monitors'])
+                old_nrpe_monitors = old_monitors['monitors']['remote']['nrpe']
+                # remove keys that are in the remove_check_queue
+                old_nrpe_monitors = {k: v for k, v in old_nrpe_monitors.items()
+                                     if k not in self.remove_check_queue}
+                # update/add nrpe_monitors
+                old_nrpe_monitors.update(nrpe_monitors)
+                old_monitors['monitors']['remote']['nrpe'] = old_nrpe_monitors
+                # write back to the relation
+                relation_set(relation_id=rid, monitors=yaml.dump(old_monitors))
+            else:
+                # write a brand new set of monitors, as no existing ones.
+                relation_set(relation_id=rid, monitors=yaml.dump(monitors))
+
+        self.remove_check_queue.clear()
 
 
 def get_nagios_hostcontext(relation_name='nrpe-external-master'):
@@ -369,7 +424,7 @@ def add_init_service_checks(nrpe, services, unit_name, immediate_check=True):
         upstart_init = '/etc/init/%s.conf' % svc
         sysv_init = '/etc/init.d/%s' % svc
 
-        if host.init_is_systemd():
+        if host.init_is_systemd(service_name=svc):
             nrpe.add_check(
                 shortname=svc,
                 description='process check {%s}' % unit_name,
@@ -453,3 +508,53 @@ def add_haproxy_checks(nrpe, unit_name):
         shortname='haproxy_queue',
         description='Check HAProxy queue depth {%s}' % unit_name,
         check_cmd='check_haproxy_queue_depth.sh')
+
+
+def remove_deprecated_check(nrpe, deprecated_services):
+    """
+    Remove checks for deprecated services in list
+
+    :param nrpe: NRPE object to remove check from
+    :type nrpe: NRPE
+    :param deprecated_services: List of deprecated services that are removed
+    :type deprecated_services: list
+    """
+    for dep_svc in deprecated_services:
+        log('Deprecated service: {}'.format(dep_svc))
+        nrpe.remove_check(shortname=dep_svc)
+
+
+def add_deferred_restarts_check(nrpe):
+    """
+    Add NRPE check for services with deferred restarts.
+
+    :param NRPE nrpe: NRPE object to add check to
+    """
+    unit_name = local_unit().replace('/', '-')
+    shortname = unit_name + '_deferred_restarts'
+    check_cmd = 'check_deferred_restarts.py --application {}'.format(
+        application_name())
+
+    log('Adding deferred restarts nrpe check: {}'.format(shortname))
+    nrpe.add_check(
+        shortname=shortname,
+        description='Check deferred service restarts {}'.format(unit_name),
+        check_cmd=check_cmd)
+
+
+def remove_deferred_restarts_check(nrpe):
+    """
+    Remove NRPE check for services with deferred service restarts.
+
+    :param NRPE nrpe: NRPE object to remove check from
+    """
+    unit_name = local_unit().replace('/', '-')
+    shortname = unit_name + '_deferred_restarts'
+    check_cmd = 'check_deferred_restarts.py --application {}'.format(
+        application_name())
+
+    log('Removing deferred restarts nrpe check: {}'.format(shortname))
+    nrpe.remove_check(
+        shortname=shortname,
+        description='Check deferred service restarts {}'.format(unit_name),
+        check_cmd=check_cmd)

@@ -12,10 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import absolute_import  # required for external apt import
-from apt import apt_pkg
-from six import string_types
-
 from charmhelpers.fetch import (
     apt_cache,
     apt_purge
@@ -26,6 +22,7 @@ from charmhelpers.core.hookenv import (
     WARNING,
 )
 from charmhelpers.contrib.hardening.audits import BaseAudit
+from charmhelpers.fetch import ubuntu_apt_pkg as apt_pkg
 
 
 class AptConfig(BaseAudit):
@@ -51,8 +48,8 @@ class RestrictedPackages(BaseAudit):
 
     def __init__(self, pkgs, **kwargs):
         super(RestrictedPackages, self).__init__(**kwargs)
-        if isinstance(pkgs, string_types) or not hasattr(pkgs, '__iter__'):
-            self.pkgs = [pkgs]
+        if isinstance(pkgs, str) or not hasattr(pkgs, '__iter__'):
+            self.pkgs = pkgs.split()
         else:
             self.pkgs = pkgs
 
@@ -100,4 +97,5 @@ class RestrictedPackages(BaseAudit):
             apt_purge(pkg.name)
 
     def is_virtual_package(self, pkg):
-        return pkg.has_provides and not pkg.has_versions
+        return (pkg.get('has_provides', False) and
+                not pkg.get('has_versions', False))
